@@ -1,37 +1,30 @@
-# online/server.py
-import os, asyncio, json, random, math, time
+# server.py
+import os, asyncio, json, random, time
 from collections import deque
 import websockets
-
-# ====== 与你本地版完全一致的核心常量 ======
+# ---------- 常量（沿用你的数值） ----------
 GRID_N = 18
-TILE = 48                     # 前端只用于渲染比例；服务器用格坐标
+TILE = 48
 ROUND_TIME = 90.0
 BUILD_TIME = 30.0
 MONITOR_TOTAL = 5.0
 B_MOVE_COOLDOWN = 2.0
-
 TRAP_STOCK_INIT = 3
 TRAP_ACTIVE_TIME = 2.0
 TRAP_COOLDOWN = 3.0
-
-# 形状（与你一致）
 SHAPES = [
-    {(0,0),(1,0),(2,0),(3,0)},                    # I
-    {(0,0),(1,0),(0,1),(1,1)},                    # O
-    {(0,0),(1,0),(2,0),(1,1)},                    # T
-    {(0,0),(0,1),(0,2),(1,2)},                    # L
-    {(1,0),(1,1),(1,2),(0,2)},                    # J
-    {(1,0),(2,0),(0,1),(1,1)},                    # S
-    {(0,0),(1,0),(1,1),(2,1)},                    # Z
-    {(0,1),(1,0),(1,1),(1,2),(2,1)},              # +
+    {(0,0),(1,0),(2,0),(3,0)},
+    {(0,0),(1,0),(0,1),(1,1)},
+    {(0,0),(1,0),(2,0),(1,1)},
+    {(0,0),(0,1),(0,2),(1,2)},
+    {(1,0),(1,1),(1,2),(0,2)},
+    {(1,0),(2,0),(0,1),(1,1)},
+    {(0,0),(1,0),(1,1),(2,1)},
+    {(0,1),(1,0),(1,1),(1,2),(2,1)},
 ]
-
-# 服务器 tick
 TICK_HZ = 30
 DT = 1.0 / TICK_HZ
 PROTO_VER = 1
-HEARTBEAT_SEC = 10
 ROOM_TTL_SEC = 300
 
 def rotate_shape(cells, k):
@@ -41,89 +34,83 @@ def rotate_shape(cells, k):
     minx = min(x for x,_ in out); miny = min(y for _,y in out)
     return {(x-minx, y-miny) for (x,y) in out}
 
+from collections import deque as _dq
 def bfs_path(walls, start, goal):
-    q = deque([start]); came = {start: None}
+    q = _dq([start]); seen={start}
     dirs = [(1,0),(-1,0),(0,1),(0,-1)]
     while q:
-        x,y = q.popleft()
-        if (x,y)==goal:
-            return True
+        x,y=q.popleft()
+        if (x,y)==goal: return True
         for dx,dy in dirs:
-            nx,ny = x+dx, y+dy
-            if 0<=nx<GRID_N and 0<=ny<GRID_N and (nx,ny) not in walls and (nx,ny) not in came:
-                came[(nx,ny)] = (x,y); q.append((nx,ny))
+            nx,ny=x+dx,y+dy
+            if 0<=nx<GRID_N and 0<=ny<GRID_N and (nx,ny) not in walls and (nx,ny) not in seen:
+                seen.add((nx,ny)); q.append((nx,ny))
     return False
 
 def random_inner_edge_cell():
+    import random
     side = random.choice(["top","bottom","left","right"])
     if side=="top": return (random.randrange(1, GRID_N-1), 1)
     if side=="bottom": return (random.randrange(1, GRID_N-1), GRID_N-2)
     if side=="left": return (1, random.randrange(1, GRID_N-1))
     return (GRID_N-2, random.randrange(1, GRID_N-1))
 
+# --------- 核心逻辑（和你一致，新增：精确碰撞 & LOBBY） ---------
 class GameCore:
-    # —— 将你 pygame 里的 reset/build_map/规则完整搬到服务端 ——
     def __init__(self):
-        self.reset_all()
-
-    def reset_all(self):
-        self.phase = "BUILD"            # MENU 交给前端；服务器从 BUILD 起
+        # 初始为 LOBBY（等待双方准备）
+        self.phase = "LOBBY"
+        self.win = None
+        self.ready = {"A": False, "B": False}
+        # 其它状态延迟到 start_match() 里初始化
+    def start_match(self):
+        # 从 LOBBY 进入 BUILD，重置一切
+        self.win=None
+        self.phase="BUILD"
         self.time_left = ROUND_TIME
         self.build_time = BUILD_TIME
         self.monitor_left = MONITOR_TOTAL
         self.monitor_active = False
         self.b_move_cooldown = 0.0
-        self.exit_open = False          # 服务器上以 A_keys>=3 作为“出口已开”依据
-        self.win = None                 # "A"/"B"/None
-
+        self.exit_open = False
         self.shape_idx = 0
         self.shape_rot = 0
         self.shape_stock = [3,3,3,3,2,2,2,1]
-
         self.trap_stock = TRAP_STOCK_INIT
         self.traps = []  # {'cell':(x,y),'active':False,'timer':0.0,'cool':0.0}
-
         self.walls, self.start, self.end, self.keys = self.build_map()
-
-        # 玩家 A 的位置（格坐标浮点，圆形移动在服务端简化为格中心逼近）
         sx, sy = self.start
         self.ax = sx + 0.5
         self.ay = sy + 0.5
-        self.a_r = 0.35                 # 半径（按格）
+        self.a_r = 0.35  # 半径（按“格”单位）
         self.a_keys = 0
 
     def build_map(self):
+        import random
         walls=set()
-        # 四周封死
         for x in range(GRID_N):
             walls.add((x,0)); walls.add((x,GRID_N-1))
         for y in range(GRID_N):
             walls.add((0,y)); walls.add((GRID_N-1,y))
         start = random_inner_edge_cell(); end = random_inner_edge_cell()
         while end==start: end = random_inner_edge_cell()
-        # 内部随机
         for y in range(2, GRID_N-2):
             for x in range(2, GRID_N-2):
-                if random.random() < 0.20:
-                    walls.add((x,y))
-        # 保证可达
+                if random.random() < 0.20: walls.add((x,y))
         tries=0
         while not bfs_path(walls, start, end) and tries<1500:
             for _ in range(40):
                 rx = random.randrange(1,GRID_N-1); ry = random.randrange(1,GRID_N-1)
                 walls.discard((rx,ry))
             tries+=1
-        # 三把钥匙
         free=[(x,y) for y in range(1,GRID_N-1) for x in range(1,GRID_N-1)
               if (x,y) not in walls and (x,y) not in (start,end)]
         random.shuffle(free); keys=free[:3]
         return walls, start, end, keys
 
-    # ===== BUILD 阶段 =====
-    def shape_cells_world(self, shape_idx, rot, base_gx, base_gy):
-        shape = rotate_shape(SHAPES[shape_idx], rot)
-        return {(base_gx+x, base_gy+y) for (x,y) in shape}
-
+    # ------- BUILD 阶段 -------
+    def shape_cells_world(self, idx, rot, gx, gy):
+        return {(gx+x, gy+y) for (x,y) in rotate_shape(SHAPES[idx], rot)}
     def valid_shape_position(self, cells):
         for (gx,gy) in cells:
             if not (0<=gx<GRID_N and 0<=gy<GRID_N): return False
@@ -131,17 +118,14 @@ class GameCore:
             if any(t['cell']==(gx,gy) for t in self.traps): return False
         tmp=set(self.walls); tmp.update(cells)
         return bfs_path(tmp, self.start, self.end)
-
-    def place_shape(self, shape_idx, rot, gx, gy):
+    def place_shape(self, idx, rot, gx, gy):
         if self.phase!="BUILD": return False,"not build"
-        if not (0<=shape_idx<8): return False,"bad shape"
-        if self.shape_stock[shape_idx]<=0: return False,"no stock"
-        cells = self.shape_cells_world(shape_idx, rot, gx, gy)
+        if not (0<=idx<8): return False,"bad shape"
+        if self.shape_stock[idx]<=0: return False,"no stock"
+        cells = self.shape_cells_world(idx, rot, gx, gy)
         if not self.valid_shape_position(cells): return False,"invalid"
-        self.walls.update(cells)
-        self.shape_stock[shape_idx]-=1
+        self.walls.update(cells); self.shape_stock[idx]-=1
         return True,"ok"
-
     def place_trap(self, gx, gy):
         if self.phase!="BUILD": return False,"not build"
         if self.trap_stock<=0: return False,"no trap"
@@ -149,36 +133,49 @@ class GameCore:
         if not (0<=gx<GRID_N and 0<=gy<GRID_N): return False,"oob"
         if cell in self.walls or cell in self.keys or cell in (self.start,self.end): return False,"occupied"
         if any(t['cell']==cell for t in self.traps): return False,"dup"
-        self.traps.append({'cell':cell,'active':False,'timer':0.0,'cool':0.0})
-        self.trap_stock-=1
+        self.traps.append({'cell':cell,'active':False,'timer':0.0,'cool':0.0}); self.trap_stock-=1
         return True,"ok"
-
     def confirm_start(self):
         if self.phase=="BUILD":
             self.phase="PLAY"; self.time_left=ROUND_TIME
             return True
         return False
 
-    # ===== PLAY 阶段 =====
+    # ------- PLAY 阶段：精确圆形碰撞 -------
+    def circle_rect_overlap(self, cx, cy, r, rx, ry, rw, rh):
+        # 计算圆心到矩形的最近点
+        nx = max(rx, min(cx, rx+rw))
+        ny = max(ry, min(cy, ry+rh))
+        dx = cx - nx; dy = cy - ny
+        return (dx*dx + dy*dy) < (r*r + 1e-9)
+    def move_axis(self, nx, ny, r, dx, dy):
+        # 仅沿一个轴尝试移动（dx,dy 有且只有一个非零）
+        tx = nx + dx; ty = ny + dy
+        # 检查附近整数格（圆可能跨越相邻格）
+        minx = int((tx - r)) - 1; maxx = int((tx + r)) + 1
+        miny = int((ty - r)) - 1; maxy = int((ty + r)) + 1
+        for gx in range(minx, maxx+1):
+            for gy in range(miny, maxy+1):
+                if (gx,gy) in self.walls:
+                    if self.circle_rect_overlap(tx, ty, r, gx, gy, 1.0, 1.0):
+                        # 发生碰撞：取消该轴移动
+                        return nx, ny
+        return tx, ty
+
     def apply_input_A(self, keys):
-        # 与你本地版相同语义：WASD，归一，速度 150px/s ≈ 3 格/s（服务端按格处理）
+        if self.phase!="PLAY" or self.win: return
         vx = (1 if keys.get("d") else 0) - (1 if keys.get("a") else 0)
         vy = (1 if keys.get("s") else 0) - (1 if keys.get("w") else 0)
         if vx==0 and vy==0: return
-        l = (vx*vx + vy*vy)**0.5
-        if l>0:
-            vx/=l; vy/=l
-        speed_grid_per_sec = 150.0 / TILE     # 与本地版等价：150px/s，按48像素一格
-        nx = self.ax + vx * speed_grid_per_sec * DT
-        ny = self.ay + vy * speed_grid_per_sec * DT
-
-        # 粗粒度的 AABB 碰撞：以圆心落在哪个格子判断是否进墙（与本地版略有差异，但结果一致性足够）
-        gx, gy = int(nx), int(self.ay)
-        if (gx, gy) not in self.walls:
-            self.ax = nx
-        gx, gy = int(self.ax), int(ny)
-        if (gx, gy) not in self.walls:
-            self.ay = ny
+        # 归一
+        l = (vx*vx + vy*vy) ** 0.5
+        if l>0: vx/=l; vy/=l
+        speed_grid_per_sec = 150.0 / TILE
+        dx = vx * speed_grid_per_sec * DT
+        dy = vy * speed_grid_per_sec * DT
+        # 分轴移动，圆-矩形碰撞
+        self.ax, self.ay = self.move_axis(self.ax, self.ay, self.a_r, dx, 0.0)
+        self.ax, self.ay = self.move_axis(self.ax, self.ay, self.a_r, 0.0, dy)
 
     def try_drag_wall(self, src, dst):
         if self.phase!="PLAY": return False,"not play"
@@ -191,18 +188,12 @@ class GameCore:
         if 0 in dst or GRID_N-1 in dst: return False,"edge forbid"
         tmp=set(self.walls); tmp.discard(src); tmp.add(dst)
         if not bfs_path(tmp, self.start, self.end): return False,"break path"
-
-        # 压中 A 判 B 胜
+        # 压中 A
         if int(self.ax)==dst[0] and int(self.ay)==dst[1]:
-            self.walls.discard(src); self.walls.add(dst)
-            self.win="B"; return True,"crush"
-
+            self.walls.discard(src); self.walls.add(dst); self.win="B"; return True,"crush"
         self.walls.discard(src); self.walls.add(dst)
         self.b_move_cooldown = B_MOVE_COOLDOWN
-
-        # 围死也 B 胜
-        if not self.player_can_reach_exit():
-            self.win="B"
+        if not self.player_can_reach_exit(): self.win="B"
         return True,"ok"
 
     def trigger_trap(self, cell):
@@ -217,57 +208,50 @@ class GameCore:
         a = (int(self.ax), int(self.ay))
         return bfs_path(self.walls, a, self.end)
 
-    # ===== TICK =====
     def step(self):
-        if self.win: return
+        if self.win or self.phase=="LOBBY": return
         if self.phase=="BUILD":
             self.build_time -= DT
-            if self.build_time<=0:
-                self.phase="PLAY"; self.time_left=ROUND_TIME
+            if self.build_time<=0: self.phase="PLAY"; self.time_left=ROUND_TIME
         elif self.phase=="PLAY":
-            # A 捡钥匙 / 开门
             a = (int(self.ax), int(self.ay))
             if a in self.keys:
                 self.keys.remove(a); self.a_keys += 1
             self.exit_open = (self.a_keys>=3)
-            # 踩陷阱即败
             for t in self.traps:
                 if t['active'] and t['cell']==a:
                     self.win="B"; break
-            # 到终点
-            if not self.win and self.exit_open and a == self.end:
-                self.win="A"
-            # 围死
-            if not self.win and not self.player_can_reach_exit():
-                self.win="B"
-            # 超时
+            if not self.win and self.exit_open and a==self.end: self.win="A"
+            if not self.win and not self.player_can_reach_exit(): self.win="B"
             self.time_left -= DT
-            if self.time_left<=0 and not self.win:
-                self.win="B"
-
-        # 陷阱与监视/冷却计时
+            if self.time_left<=0 and not self.win: self.win="B"
+        # 计时
         for t in self.traps:
             if t['active']:
                 t['timer'] -= DT
-                if t['timer'] <= 0:
-                    t['active']=False; t['timer']=0.0
-            if t['cool']>0:
-                t['cool'] = max(0.0, t['cool'] - DT)
+                if t['timer']<=0: t['active']=False; t['timer']=0.0
+            if t['cool']>0: t['cool']=max(0.0, t['cool']-DT)
         if self.monitor_active and self.monitor_left>0:
             self.monitor_left = max(0.0, self.monitor_left - DT)
         if self.b_move_cooldown>0:
             self.b_move_cooldown = max(0.0, self.b_move_cooldown - DT)
 
     def to_state(self):
-        return {
+        # LOBBY 也会广播 ready 状态
+        base = {
             "phase": self.phase,
+            "win": self.win,
+            "ready": {"A": self.ready["A"], "B": self.ready["B"]},
+        }
+        if self.phase=="LOBBY":
+            return base
+        base.update({
             "timeLeft": round(self.time_left,2),
             "buildTime": round(self.build_time,2),
             "monitorLeft": round(self.monitor_left,2),
             "monitorActive": self.monitor_active,
             "bMoveCooldown": round(self.b_move_cooldown,2),
             "exitOpen": self.exit_open,
-            "win": self.win,
             "A": {"x": self.ax, "y": self.ay, "keys": self.a_keys},
             "walls": sorted(list(self.walls)),
             "traps": [{"cell": t["cell"], "active": t["active"]} for t in self.traps],
@@ -275,8 +259,10 @@ class GameCore:
             "start": self.start,
             "end": self.end,
             "shapeStock": list(self.shape_stock),
-        }
+        })
+        return base
 
+# --------- 房间管理（新增 ready 流程） ---------
 class Room:
     def __init__(self, rid):
         self.id = rid
@@ -284,33 +270,40 @@ class Room:
         self.players = {"A": None, "B": None}
         self.queue = deque()
         self.last_active = time.time()
-
-    def empty(self):
-        return (self.players["A"] is None) and (self.players["B"] is None)
-
+    def empty(self): return (self.players["A"] is None) and (self.players["B"] is None)
     async def handle(self, role, msg):
         t = msg.get("t")
-        if t=="input" and role=="A" and self.core.phase=="PLAY" and not self.core.win:
-            self.core.apply_input_A(msg.get("keys", {}))
+        c = self.core
+        if t=="ready":
+            c.ready[role] = bool(msg.get("on", True))
+            # 双方都准备 -> 开局
+            if c.phase=="LOBBY" and c.ready["A"] and c.ready["B"]:
+                c.start_match()
+        elif t=="input" and role=="A" and c.phase=="PLAY" and not c.win:
+            c.apply_input_A(msg.get("keys", {}))
         elif t=="place" and role=="B":
-            ok,reason = self.core.place_shape(msg["shape"], msg.get("rot",0), msg["gx"], msg["gy"])
+            ok,reason = c.place_shape(msg["shape"], msg.get("rot",0), msg["gx"], msg["gy"])
             await self.reply(role, {"t":"ack","cmd":"place","ok":ok,"reason":reason})
         elif t=="trap" and role=="B":
-            ok,reason = self.core.place_trap(*msg["cell"])
+            if c.phase=="BUILD":
+                ok,reason = c.place_trap(*msg["cell"])
+            else:
+                ok,reason = c.trigger_trap(msg["cell"])
             await self.reply(role, {"t":"ack","cmd":"trap","ok":ok,"reason":reason})
         elif t=="confirm" and role=="B":
-            ok = self.core.confirm_start()
+            ok = c.confirm_start()
             await self.reply(role, {"t":"ack","cmd":"confirm","ok":ok})
         elif t=="drag" and role=="B":
-            ok,reason = self.core.try_drag_wall(msg["src"], msg["dst"])
+            ok,reason = c.try_drag_wall(msg["src"], msg["dst"])
             await self.reply(role, {"t":"ack","cmd":"drag","ok":ok,"reason":reason})
         elif t=="monitor" and role=="B":
-            self.core.monitor_active = bool(msg.get("on")) and self.core.monitor_left>0
+            c.monitor_active = bool(msg.get("on")) and c.monitor_left>0
             await self.reply(role, {"t":"ack","cmd":"monitor","ok":True})
         elif t=="reset":
-            self.core.reset_all(); await self.reply(role, {"t":"ack","cmd":"reset","ok":True})
+            # 回到 LOBBY：清空准备状态
+            self.core = GameCore()
+            await self.reply(role, {"t":"ack","cmd":"reset","ok":True})
         self.last_active = time.time()
-
     async def loop(self):
         while True:
             while self.queue:
@@ -322,20 +315,16 @@ class Room:
             self.core.step()
             await self.broadcast({"t":"state","s": self.core.to_state()})
             await asyncio.sleep(DT)
-
     async def broadcast(self, payload):
         data = json.dumps(payload)
         await asyncio.gather(*[
             ws.send(data) for ws in self.players.values() if ws and ws.open
         ], return_exceptions=True)
-
     async def reply(self, role, payload):
         ws = self.players.get(role)
-        if ws and ws.open:
-            await ws.send(json.dumps(payload))
+        if ws and ws.open: await ws.send(json.dumps(payload))
 
 rooms = {}
-
 def get_room(rid):
     if rid not in rooms:
         r = Room(rid)
@@ -345,14 +334,11 @@ def get_room(rid):
 
 async def reaper():
     while True:
-        now = time.time()
-        dead = []
-        for rid, r in list(rooms.items()):
-            if r.empty() and now - r.last_active > ROOM_TTL_SEC:
-                dead.append(rid)
+        now=time.time(); dead=[]
+        for rid,r in list(rooms.items()):
+            if r.empty() and now-r.last_active>ROOM_TTL_SEC: dead.append(rid)
         for rid in dead:
-            rooms.pop(rid, None)
-            print("[reaper] remove room", rid)
+            rooms.pop(rid, None); print("[reaper] remove room", rid)
         await asyncio.sleep(10)
 
 async def handler(ws, path):
@@ -367,11 +353,10 @@ async def handler(ws, path):
                 rid = msg.get("room","default")
                 role = "B" if msg.get("role")=="B" else "A"
                 room = get_room(rid)
-                # 顶掉旧连接
                 old = room.players.get(role)
-                if old and old.open:
-                    await old.close()
+                if old and old.open: await old.close()
                 room.players[role] = ws
+                # 新连接先收到一次 state
                 await ws.send(json.dumps({"t":"state","s": room.core.to_state()}))
             elif msg.get("t")=="ping":
                 await ws.send(json.dumps({"t":"pong"}))
